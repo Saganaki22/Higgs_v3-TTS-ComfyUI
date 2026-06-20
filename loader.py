@@ -444,8 +444,6 @@ def unload_higgs_bundle(bundle: HiggsV3Bundle | None, reason: str = "manual unlo
             module.model_loaded_weight_memory = 0
             if hasattr(module, "dynamic_vbars"):
                 module.dynamic_vbars.clear()
-            if hasattr(module, "dynamic_pins"):
-                module.dynamic_pins.clear()
             if hard and hasattr(module, "to_empty"):
                 module.to_empty(device=torch.device("meta"))
         except Exception:
@@ -527,8 +525,6 @@ def load_higgs_bundle(
                 module.model_loaded_weight_memory = 0
                 if hasattr(module, "dynamic_vbars"):
                     module.dynamic_vbars.clear()
-                if hasattr(module, "dynamic_pins"):
-                    module.dynamic_pins.clear()
                 if hasattr(module, "to_empty"):
                     module.to_empty(device=torch.device("meta"))
             except Exception:
