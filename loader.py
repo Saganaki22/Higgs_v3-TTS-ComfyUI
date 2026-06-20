@@ -5,9 +5,7 @@ from __future__ import annotations
 import gc
 import importlib.util
 import logging
-import math
 import shutil
-import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,9 +15,11 @@ import torch
 from .native import (
     HiggsAudioCodec,
     build_native_model,
+    convert_modules_for_comfy,
     load_native_weights,
     load_tokenizer,
     read_config,
+    set_runtime_dtype,
 )
 
 logger = logging.getLogger("Higgs_v3-TTS-ComfyUI")
@@ -60,176 +60,13 @@ class HiggsV3Bundle:
     patchers: list[Any] = field(default_factory=list)
 
 
-def _module_unique_tensors(module: torch.nn.Module) -> list[torch.Tensor]:
-    seen: set[int] = set()
-    tensors: list[torch.Tensor] = []
-    for tensor in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
-        ident = id(tensor)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        tensors.append(tensor)
-    return tensors
-
-
-def _same_device(a: torch.device, b: torch.device) -> bool:
-    a = torch.device(a)
-    b = torch.device(b)
-    return a.type == b.type and (a.index or 0) == (b.index or 0)
-
-
-class HiggsV3VBar:
-    page_size: int = 32 * 1024 * 1024
-
-    def __init__(self, model: torch.nn.Module, device: torch.device):
-        self.model = model
-        self.device = torch.device(device)
-        self.tensors: list[torch.Tensor] = []
-        self.total_size = 0
-        self.total_pages = 1
-        self.watermark = 0
-        self._refresh_tensors()
-
-    @property
-    def offset(self) -> int:
-        return self.total_size
-
-    def _refresh_tensors(self) -> None:
-        self.tensors = _module_unique_tensors(self.model)
-        self.total_size = sum(t.nelement() * t.element_size() for t in self.tensors if t.device.type != "meta")
-        self.total_pages = max(1, math.ceil(self.total_size / self.page_size)) if self.total_size > 0 else 0
-
-    def loaded_size(self) -> int:
-        self._refresh_tensors()
-        return sum(
-            t.nelement() * t.element_size()
-            for t in self.tensors
-            if t.device.type != "meta" and _same_device(t.device, self.device)
-        )
-
-    def get_residency(self) -> list[int]:
-        self._refresh_tensors()
-        if self.total_size <= 0:
-            return []
-        residency = [0 for _ in range(self.total_pages)]
-        cursor = 0
-        for tensor in self.tensors:
-            if tensor.device.type == "meta":
-                continue
-            size = tensor.nelement() * tensor.element_size()
-            if size <= 0:
-                continue
-            if _same_device(tensor.device, self.device):
-                start_page = cursor // self.page_size
-                end_page = min(self.total_pages - 1, (cursor + size - 1) // self.page_size)
-                for page in range(start_page, end_page + 1):
-                    residency[page] |= 1
-            cursor += size
-        return residency
-
-    def get_watermark(self) -> int:
-        self.watermark = max(self.watermark, self.loaded_size())
-        return self.watermark
-
-    def prioritize(self) -> None:
-        self.watermark = self.loaded_size()
-
-
 try:
     import comfy.model_patcher as _model_patcher
 
-    class HiggsV3Patcher(_model_patcher.ModelPatcher):
-        def __init__(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
-            super().__init__(model, load_device, offload_device, size, weight_inplace_update)
-            self._ensure_dynamic_state(load_device)
-
-        def is_dynamic(self):
-            return True
-
-        def _ensure_dynamic_state(self, device):
-            device = torch.device(device)
-            if not hasattr(self.model, "dynamic_vbars"):
-                self.model.dynamic_vbars = {}
-            if not hasattr(self.model, "dynamic_pins"):
-                self.model.dynamic_pins = {}
-            if device not in self.model.dynamic_pins:
-                try:
-                    import comfy_aimdo.host_buffer
-
-                    empty_hostbuf = comfy_aimdo.host_buffer.HostBuffer(0, 0, 0)
-                except Exception:
-                    empty_hostbuf = None
-                self.model.dynamic_pins[device] = {
-                    "weights": (empty_hostbuf, [], [-1], [0], [0], {}),
-                    "patches": (empty_hostbuf, [], [-1], [0], [0], {}),
-                    "hostbufs_initialized": False,
-                    "failed": False,
-                    "active": False,
-                }
-
-        def _vbar_get(self):
-            vbars = getattr(self.model, "dynamic_vbars", {})
-            if vbars:
-                return next(iter(vbars.values()))
-            return None
-
-        def loaded_size(self):
-            vbar = self._vbar_get()
-            if vbar is not None:
-                return vbar.loaded_size()
-            return getattr(self.model, "model_loaded_weight_memory", 0)
-
-        def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-            self._ensure_dynamic_state(torch.device(device_to))
-            before = self.loaded_size()
-            self.model.to(device_to)
-            self.model.model_loaded_weight_memory = self.model_size()
-            return max(0, self.loaded_size() - before)
-
-        def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-            before = self.loaded_size()
-            self.detach()
-            return before
-
-        def detach(self, unpatch_all=True):
-            try:
-                if bool(getattr(self, "_higgs_hard_detach", False)) and hasattr(self.model, "to_empty"):
-                    self.model.to_empty(device=torch.device("meta"))
-                else:
-                    self.model.to(self.offload_device)
-                self.model.model_loaded_weight_memory = 0
-                if hasattr(self.model, "dynamic_vbars"):
-                    self.model.dynamic_vbars.clear()
-                if hasattr(self.model, "dynamic_pins"):
-                    self.model.dynamic_pins.clear()
-            except Exception:
-                pass
-            finally:
-                self._higgs_hard_detach = False
-            _empty_accelerator_cache()
-            return self.model
-
-        def current_loaded_device(self):
-            try:
-                return next(self.model.parameters()).device
-            except StopIteration:
-                return self.offload_device
-
-        def loaded_ram_size(self):
-            return 0
-
-        def pinned_memory_size(self):
-            return 0
-
-        def unregister_inactive_pins(self, ram_to_unload, subsets=["weights", "patches"]):
-            return 0
-
-        def partially_unload_ram(self, ram_to_unload, subsets=["weights", "patches"]):
-            return 0
-
+    _ComfyCorePatcher = _model_patcher.CoreModelPatcher
     del _model_patcher
 except Exception:
-    HiggsV3Patcher = None
+    _ComfyCorePatcher = None
 
 
 def _empty_accelerator_cache() -> None:
@@ -417,30 +254,58 @@ def resolve_attention(attention: str) -> tuple[str, str | None]:
     raise ValueError(f"Unsupported attention mode: {attention}")
 
 
-def _register_with_comfy(patcher: Any) -> None:
-    if patcher is None:
+def dynamic_vram_active(device: torch.device) -> bool:
+    if torch.device(device).type == "cpu":
+        return False
+    try:
+        import comfy.memory_management
+
+        if not bool(comfy.memory_management.aimdo_enabled):
+            return False
+        try:
+            import comfy_aimdo.control
+            import comfy_aimdo.host_buffer
+            import comfy_aimdo.model_vbar
+
+            return (
+                comfy_aimdo.control.lib is not None
+                and comfy_aimdo.host_buffer.lib is not None
+                and comfy_aimdo.model_vbar.lib is not None
+            )
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _register_many_with_comfy(patchers: list[Any]) -> None:
+    patchers = [
+        patcher
+        for patcher in patchers
+        if patcher is not None and patcher.load_device.type != "cpu"
+    ]
+    if not patchers:
         return
     try:
         import comfy.model_management as mm
 
-        if patcher.load_device.type == "cpu":
+        already_loaded = {
+            id(loaded.model)
+            for loaded in mm.current_loaded_models
+            if loaded.model is not None
+        }
+        to_load = [patcher for patcher in patchers if id(patcher) not in already_loaded]
+        if not to_load:
             return
-        if any(loaded.model is patcher for loaded in mm.current_loaded_models):
-            return
-        raw = patcher.model
-        if hasattr(patcher, "_ensure_dynamic_state"):
-            patcher._ensure_dynamic_state(patcher.load_device)
-        raw.model_loaded_weight_memory = patcher.loaded_size()
-        raw.dynamic_vbars = {patcher.load_device: HiggsV3VBar(raw, patcher.load_device)}
-        loaded = mm.LoadedModel(patcher)
-        loaded.real_model = weakref.ref(raw)
-        loaded.model_finalizer = weakref.finalize(raw, mm.cleanup_models)
-        loaded.model_finalizer.atexit = False
-        loaded.currently_used = True
-        mm.current_loaded_models.insert(0, loaded)
-        logger.info("Registered %s with ComfyUI/AIMDO memory tracking.", raw.__class__.__name__)
+        mm.load_models_gpu(to_load)
+        for patcher in to_load:
+            logger.info(
+                "Loaded %s through ComfyUI%s memory management.",
+                patcher.model.__class__.__name__,
+                "/AIMDO" if patcher.is_dynamic() else "",
+            )
     except Exception as exc:
-        logger.warning("Could not register Higgs module with ComfyUI memory tracking: %s", exc)
+        raise RuntimeError("Could not load model through ComfyUI memory management.") from exc
 
 
 def _unregister_from_comfy(patcher: Any) -> None:
@@ -471,21 +336,76 @@ def _unregister_from_comfy(patcher: Any) -> None:
         pass
 
 
-def register_runtime_module(module: torch.nn.Module, device: torch.device) -> Any:
-    if HiggsV3Patcher is None or torch.device(device).type == "cpu":
+def _set_module_device_if_writable(module: torch.nn.Module, device: torch.device) -> None:
+    try:
+        module.device = torch.device(device)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+
+
+def _ensure_writable_device_property(module: torch.nn.Module) -> None:
+    cls = module.__class__
+    prop = getattr(cls, "device", None)
+    if not isinstance(prop, property) or prop.fset is not None:
+        return
+    if getattr(module, "_higgs_writable_device_property", False):
+        return
+
+    def _get_device(self):
+        runtime_device = self.__dict__.get("_higgs_runtime_device")
+        if runtime_device is not None:
+            return runtime_device
+        return prop.fget(self)
+
+    def _set_device(self, value):
+        self.__dict__["_higgs_runtime_device"] = torch.device(value)
+
+    writable_cls = type(
+        cls.__name__,
+        (cls,),
+        {
+            "device": property(_get_device, _set_device),
+            "_higgs_device_base_class": cls,
+            "__module__": cls.__module__,
+        },
+    )
+    module.__class__ = writable_cls
+    module._higgs_writable_device_property = True
+
+
+def register_runtime_module(module: torch.nn.Module, device: torch.device, *, dynamic: bool | None = None) -> Any:
+    device = torch.device(device)
+    module._higgs_runtime_device = torch.device(device)
+    _ensure_writable_device_property(module)
+    if _ComfyCorePatcher is None or device.type == "cpu":
         module.to(device)
         return None
-    patcher = HiggsV3Patcher(module, load_device=torch.device(device), offload_device=torch.device("cpu"))
-    module.model_loaded_weight_memory = patcher.model_size()
-    _register_with_comfy(patcher)
+
+    import comfy.model_patcher as model_patcher
+
+    use_dynamic = dynamic_vram_active(device) and dynamic is not False
+    patcher_class = (
+        model_patcher.ModelPatcherDynamic
+        if use_dynamic
+        else model_patcher.ModelPatcher
+    )
+    patcher = patcher_class(module, load_device=device, offload_device=torch.device("cpu"))
+    module.model_loaded_weight_memory = 0
+    _register_many_with_comfy([patcher])
+    if not patcher.is_dynamic():
+        _set_module_device_if_writable(module, device)
+    logger.info(
+        "Registered %s with ComfyUI%s memory management.",
+        module.__class__.__name__,
+        "/AIMDO" if patcher.is_dynamic() else "",
+    )
     return patcher
 
 
 def resume_runtime_module(patcher: Any, device: torch.device) -> None:
-    if patcher is None:
-        return
-    patcher.partially_load(torch.device(device))
-    _register_with_comfy(patcher)
+    del device
+    if patcher is not None:
+        _register_many_with_comfy([patcher])
 
 
 def unload_runtime_module(patcher: Any, *, hard: bool = True) -> None:
@@ -493,7 +413,6 @@ def unload_runtime_module(patcher: Any, *, hard: bool = True) -> None:
         return
     _unregister_from_comfy(patcher)
     try:
-        patcher._higgs_hard_detach = bool(hard)
         patcher.detach()
     except Exception:
         pass
@@ -577,18 +496,46 @@ def load_higgs_bundle(
 
     config = read_config(runtime_dir)
     logger.info("Loading Higgs v3 from %s on %s with dtype=%s attention=%s", runtime_dir, device, torch_dtype, runtime_attention)
+    weight_device = torch.device("cpu") if device.type != "cpu" else device
     model = build_native_model(config, torch_dtype, hf_attention)
-    load_native_weights(model, runtime_dir, device, torch_dtype)
-    codec = HiggsAudioCodec.from_pretrained(runtime_dir, device=device, dtype=torch_dtype)
+    load_native_weights(model, runtime_dir, weight_device, torch_dtype)
+    codec = HiggsAudioCodec.from_pretrained(runtime_dir, device=weight_device, dtype=torch_dtype, runtime_device=device)
+    convert_modules_for_comfy(model)
+    convert_modules_for_comfy(codec.model)
+    set_runtime_dtype(model, torch_dtype)
+    set_runtime_dtype(codec.model, torch_dtype)
     tokenizer = load_tokenizer(runtime_dir)
 
     patchers: list[Any] = []
-    model_patcher = register_runtime_module(model, device)
-    if model_patcher is not None:
-        patchers.append(model_patcher)
-    codec_patcher = register_runtime_module(codec.model, device)
-    if codec_patcher is not None:
-        patchers.append(codec_patcher)
+    try:
+        use_dynamic = dynamic_vram_active(device)
+        if use_dynamic:
+            logger.info("AIMDO DynamicVRAM is active; using dynamic patchers for Higgs v3 model and codec.")
+        else:
+            logger.info("AIMDO not active; using static ComfyUI memory management.")
+        model_patcher = register_runtime_module(model, device, dynamic=use_dynamic)
+        if model_patcher is not None:
+            patchers.append(model_patcher)
+        codec_patcher = register_runtime_module(codec.model, device, dynamic=use_dynamic)
+        if codec_patcher is not None:
+            patchers.append(codec_patcher)
+    except Exception:
+        for patcher in list(patchers):
+            unload_runtime_module(patcher, hard=True)
+        for module in (model, codec.model):
+            try:
+                module.model_loaded_weight_memory = 0
+                if hasattr(module, "dynamic_vbars"):
+                    module.dynamic_vbars.clear()
+                if hasattr(module, "dynamic_pins"):
+                    module.dynamic_pins.clear()
+                if hasattr(module, "to_empty"):
+                    module.to_empty(device=torch.device("meta"))
+            except Exception:
+                pass
+        gc.collect()
+        _empty_accelerator_cache()
+        raise
 
     bundle = HiggsV3Bundle(
         model=model,
@@ -603,9 +550,47 @@ def load_higgs_bundle(
     )
     _ACTIVE_BUNDLE = bundle
     _ACTIVE_LOAD_KEY = load_key
+    install_comfy_unload_hook()
     _empty_accelerator_cache()
     return bundle
 
 
 def unload_active_bundle() -> None:
     unload_higgs_bundle(_ACTIVE_BUNDLE, reason="active unload")
+
+
+def install_comfy_unload_hook() -> None:
+    """Patch ComfyUI unload calls so the active native Higgs bundle hard-releases."""
+    try:
+        import comfy.model_management as mm
+    except Exception:
+        return
+
+    if getattr(mm, "_higgsv3_unload_hook_installed", False):
+        return
+
+    original_unload_all_models = mm.unload_all_models
+
+    def unload_all_models_with_higgsv3(*args, **kwargs):
+        try:
+            return original_unload_all_models(*args, **kwargs)
+        finally:
+            unload_higgs_bundle(_ACTIVE_BUNDLE, reason="ComfyUI unload_all_models")
+
+    mm.unload_all_models = unload_all_models_with_higgsv3
+
+    original_unload_model_and_clones = getattr(mm, "unload_model_and_clones", None)
+    if original_unload_model_and_clones is not None:
+        def unload_model_and_clones_with_higgsv3(model, *args, **kwargs):
+            try:
+                return original_unload_model_and_clones(model, *args, **kwargs)
+            finally:
+                if _ACTIVE_BUNDLE is not None and model is not None:
+                    owned = list(_ACTIVE_BUNDLE.patchers) + [_ACTIVE_BUNDLE.model, _ACTIVE_BUNDLE.codec.model]
+                    if any(existing is model or existing is getattr(model, "model", None) for existing in owned if existing is not None):
+                        unload_higgs_bundle(_ACTIVE_BUNDLE, reason="ComfyUI unload_model_and_clones")
+
+        mm.unload_model_and_clones = unload_model_and_clones_with_higgsv3
+
+    mm._higgsv3_unload_hook_installed = True
+    logger.debug("Installed Higgs v3 unload hook for ComfyUI native unload.")

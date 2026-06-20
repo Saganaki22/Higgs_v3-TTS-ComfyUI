@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .loader import register_runtime_module, resume_runtime_module
+from .loader import dynamic_vram_active, register_runtime_module, resume_runtime_module
 
 logger = logging.getLogger("Higgs_v3-TTS-ComfyUI")
 
@@ -163,30 +163,53 @@ def _resolve_dtype(dtype: str, device: str) -> torch.dtype:
 def get_whisper_pipeline(model_name: str, dtype: str, download_if_missing: bool):
     register_audio_encoders_folder()
     device = _resolve_device()
+    target_device = torch.device(device)
     key = (model_name, dtype, device)
     cached = _PIPELINE_CACHE.get(key)
     if cached is not None:
         patcher = getattr(cached, "_higgsv3_aimdo_patcher", None)
         if patcher is not None:
-            resume_runtime_module(patcher, torch.device(device))
+            resume_runtime_module(patcher, target_device)
         return cached
 
     from transformers import pipeline as hf_pipeline
 
     model_path = _resolve_whisper_path(model_name, download_if_missing)
     torch_dtype = _resolve_dtype(dtype, device)
+    force_aimdo_dynamic = dynamic_vram_active(target_device)
+    pipeline_device = "cpu" if force_aimdo_dynamic else device
+    if force_aimdo_dynamic:
+        logger.info("AIMDO DynamicVRAM is active; staging Whisper ASR on CPU before dynamic registration.")
     logger.info("Loading Whisper ASR from %s on %s with %s", model_path, device, torch_dtype)
     pipe = hf_pipeline(
         "automatic-speech-recognition",
         model=str(model_path),
         torch_dtype=torch_dtype,
-        device=device,
+        device=pipeline_device,
     )
+    if force_aimdo_dynamic:
+        try:
+            from .native import convert_modules_for_comfy, set_runtime_dtype
+
+            convert_modules_for_comfy(pipe.model)
+            set_runtime_dtype(pipe.model, torch_dtype)
+        except Exception as exc:
+            logger.warning("Could not prepare Whisper ASR modules for AIMDO dynamic casting: %s", exc)
     try:
-        patcher = register_runtime_module(pipe.model, torch.device(device))
+        patcher = register_runtime_module(pipe.model, target_device, dynamic=force_aimdo_dynamic)
         setattr(pipe, "_higgsv3_aimdo_patcher", patcher)
+        try:
+            pipe.device = target_device
+        except Exception:
+            pass
     except Exception as exc:
-        logger.warning("Could not register Whisper ASR with ComfyUI memory tracking: %s", exc)
+        logger.warning("Could not register Whisper ASR with ComfyUI memory management: %s", exc)
+        if pipeline_device != device:
+            pipe.model.to(target_device)
+            try:
+                pipe.device = target_device
+            except Exception:
+                pass
     _PIPELINE_CACHE[key] = pipe
     return pipe
 

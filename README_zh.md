@@ -4,9 +4,9 @@
 
 **[English](./README.md)** | **中文**
 
-**版本：v0.1.5**
+**版本：v0.1.7**
 
-[bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) 的 ComfyUI 原生节点：多语言对话式 TTS、零样本语音克隆、内联情感/风格/韵律/音效标签、长文本分块、多说话人对话、Whisper 参考音频转写，以及 ComfyUI/AIMDO 显存追踪。
+[bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) 的 ComfyUI 原生节点：多语言对话式 TTS、零样本语音克隆、内联情感/风格/韵律/音效标签、长文本分块、多说话人对话、Whisper 参考音频转写，以及 ComfyUI/AIMDO DynamicVRAM 支持。
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![Hugging Face](https://img.shields.io/badge/HuggingFace-bosonai%2Fhiggs--audio--v3--tts--4b-blue)](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b)
@@ -24,7 +24,7 @@
 - **多说话人对话** — 使用 `[Speaker_1]:`、`[Speaker_2]:` 等标签配合各自的参考音频。
 - **内联控制** — 情感、风格、韵律、停顿和音效可直接在提示文本中输入。
 - **长文本分块** — 在句子/停顿边界处拆分长文本，避免切断 `<|...|>` 标签。
-- **AIMDO/VRAM 可见性** — Higgs 和 Whisper 的 torch 模块通过真实张量注册到 ComfyUI 模型管理中。
+- **AIMDO DynamicVRAM 支持** — Higgs 模型/codec 权重先加载到 CPU，启用 DynamicVRAM 时使用 ComfyUI/AIMDO 分页。
 - **托管模型文件夹** — 模型文件存放在 `ComfyUI/models/higgsv3tts/` 下。
 - **无保持加载开关，无卸载节点** — 加载器内部处理模型切换的清理工作。
 
@@ -83,7 +83,7 @@ ComfyUI/custom_nodes/Higgs_v3-TTS-ComfyUI/assets/higgs-audio-v3-tts-4b/
 ComfyUI/models/higgsv3tts/higgs-audio-v3-tts-4b/
 ```
 
-检查点磁盘大小约 **9.31 GB**。CUDA `bf16` 下 Higgs 模型/codec 路径大约需要 **11 GB VRAM**，另外还需要给 ComfyUI 和其他已加载模型留出余量。
+检查点磁盘大小约 **9.31 GB**。CUDA `bf16` 下 Higgs 模型/codec 路径大约需要 **11 GB VRAM**，另外还需要给 ComfyUI 和其他已加载模型留出余量。AIMDO DynamicVRAM 可以通过分页可转换权重降低实时 VRAM 压力，但在低显存工作流充分测试之前，仍建议以 11 GB+ 作为目标。
 
 ## 节点
 
@@ -353,7 +353,7 @@ ComfyUI 节点进度条会根据原生音频 token 进度持续更新。对于�
 
 ## 显存行为
 
-Higgs v3 和 Whisper 注册到 ComfyUI 模型管理中，以便内存工具检查真实张量驻留情况。
+Higgs v3 会先将权重加载到 CPU，将 Qwen/Higgs/codec torch 模块转换为 Comfy 可 cast 的模块，并通过 ComfyUI 模型管理注册模型和 codec。启用 AIMDO DynamicVRAM 时，可转换权重会使用 VBAR 后端，并在 forward 期间分页进入 VRAM；未启用 AIMDO 时，ComfyUI 会回退到普通静态模型加载。Whisper 也会注册到 ComfyUI 模型管理。
 
 没有专用卸载节点，也没有保持加载开关。更改模型、dtype、设备或注意力设置时，会先硬卸载之前的活跃 Higgs 模型包再加载新的：注销 Comfy model patcher、清空 AIMDO 状态、将权重移到 meta、断开 bundle 引用、运行 Python GC，并请求 Comfy/PyTorch 清空加速器缓存。
 

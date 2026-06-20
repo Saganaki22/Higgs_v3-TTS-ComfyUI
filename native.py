@@ -20,6 +20,15 @@ from safetensors import safe_open
 from tokenizers import Tokenizer
 from torch import nn
 try:
+    from comfy.ops import cast_bias_weight, uncast_bias_weight
+except Exception:
+    def cast_bias_weight(model, input=None, **kwargs):
+        return model.weight, getattr(model, "bias", None), None
+
+    def uncast_bias_weight(model, weight, bias, offload_stream):
+        return None
+
+try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
@@ -272,7 +281,7 @@ class HiggsNativeTTS(nn.Module):
         top_k: int | None,
         progress_callback=None,
     ) -> torch.Tensor:
-        device = next(self.parameters()).device
+        device = torch.device(getattr(self, "_higgs_runtime_device", next(self.parameters()).device))
         prompt_embeds = self._prompt_embeds(prompt_ids, reference_codes_delayed, device)
         out = self.backbone.model(inputs_embeds=prompt_embeds, use_cache=True)
         past = out.past_key_values
@@ -374,11 +383,18 @@ def _codec_state_dict(model_dir: Path) -> dict[str, torch.Tensor]:
 class HiggsAudioCodec:
     def __init__(self, model: HiggsAudioV2TokenizerModel, device: torch.device) -> None:
         self.model = model
-        self.device = device
+        self.device = torch.device(device)
         self.dtype = next(model.parameters()).dtype
 
     @classmethod
-    def from_pretrained(cls, model_dir: Path, *, device: torch.device, dtype: torch.dtype) -> "HiggsAudioCodec":
+    def from_pretrained(
+        cls,
+        model_dir: Path,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        runtime_device: torch.device | None = None,
+    ) -> "HiggsAudioCodec":
         model = HiggsAudioV2TokenizerModel(_codec_config()).to(dtype=dtype).eval()
         state = _codec_state_dict(model_dir)
         missing, _unexpected = model.load_state_dict(state, strict=False)
@@ -389,7 +405,7 @@ class HiggsAudioCodec:
         model = model.to(device=device)
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        return cls(model, device)
+        return cls(model, runtime_device or device)
 
     @torch.no_grad()
     def encode_reference(self, waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
@@ -414,6 +430,227 @@ class HiggsAudioCodec:
     def decode(self, codes_t_n: torch.Tensor) -> torch.Tensor:
         codes_b_n_t = codes_t_n.transpose(0, 1).unsqueeze(0).to(device=self.device, dtype=torch.long)
         return self.model.decode(codes_b_n_t).audio_values.squeeze(0).squeeze(0).detach().float().cpu()
+
+
+class _ComfyLinear(nn.Linear):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+
+    def forward(self, x):
+        if not hasattr(self, "_v") and self.weight.device == x.device:
+            return F.linear(x, self.weight, self.bias)
+        weight, bias, stream = cast_bias_weight(self, x, offloadable=True)
+        try:
+            return F.linear(x, weight, bias)
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+class _ComfyEmbedding(nn.Embedding):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+    bias = None
+
+    def _weight_dtype(self):
+        return getattr(self, "weight_comfy_model_dtype", None) or self.weight.dtype
+
+    def forward(self, input):
+        if not hasattr(self, "_v") and self.weight.device == input.device:
+            return F.embedding(
+                input, self.weight, self.padding_idx, self.max_norm,
+                self.norm_type, self.scale_grad_by_freq, self.sparse)
+        weight, bias, stream = cast_bias_weight(
+            self,
+            dtype=self._weight_dtype(),
+            device=input.device,
+            offloadable=True,
+        )
+        try:
+            return F.embedding(
+                input, weight, self.padding_idx, self.max_norm,
+                self.norm_type, self.scale_grad_by_freq, self.sparse)
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+class _ComfyConv1d(nn.Conv1d):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+
+    def forward(self, input):
+        if (
+            not hasattr(self, "_v")
+            and self.weight.device == input.device
+            and (self.bias is None or self.bias.device == input.device)
+        ):
+            return self._conv_forward(input, self.weight, self.bias)
+        weight, bias, stream = cast_bias_weight(self, input, offloadable=True)
+        try:
+            return self._conv_forward(input, weight, bias)
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+class _ComfyConvTranspose1d(nn.ConvTranspose1d):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+
+    def forward(self, input, output_size=None):
+        num_spatial_dims = 1
+        output_padding = self._output_padding(
+            input,
+            output_size,
+            self.stride,
+            self.padding,
+            self.kernel_size,
+            num_spatial_dims,
+            self.dilation,
+        )
+        if (
+            not hasattr(self, "_v")
+            and self.weight.device == input.device
+            and (self.bias is None or self.bias.device == input.device)
+        ):
+            return F.conv_transpose1d(
+                input,
+                self.weight,
+                self.bias,
+                self.stride,
+                self.padding,
+                output_padding,
+                self.groups,
+                self.dilation,
+            )
+        weight, bias, stream = cast_bias_weight(self, input, offloadable=True)
+        try:
+            return F.conv_transpose1d(
+                input,
+                weight,
+                bias,
+                self.stride,
+                self.padding,
+                output_padding,
+                self.groups,
+                self.dilation,
+            )
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+class _ComfyHiggsFusedMultiTextEmbedding(HiggsFusedMultiTextEmbedding):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+    bias = None
+
+    def _weight_dtype(self):
+        return getattr(self, "weight_comfy_model_dtype", None) or self.weight.dtype
+
+    def forward(self, codes_l_n: torch.Tensor) -> torch.Tensor:
+        offsets = torch.arange(
+            self.num_codebooks,
+            device=codes_l_n.device,
+            dtype=codes_l_n.dtype,
+        ) * self.vocab_size
+        if not hasattr(self, "_v") and self.weight.device == codes_l_n.device:
+            weight = self.weight
+            stream = None
+            bias = None
+        else:
+            weight, bias, stream = cast_bias_weight(
+                self,
+                dtype=self._weight_dtype(),
+                device=codes_l_n.device,
+                offloadable=True,
+            )
+        try:
+            return F.embedding(codes_l_n + offsets, weight).sum(dim=-2)
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+class _ComfyHiggsFusedMultiTextHead(HiggsFusedMultiTextHead):
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
+    bias = None
+
+    def generate(self, hidden_l_d: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_v") and self.weight.device == hidden_l_d.device:
+            weight = self.weight
+            stream = None
+            bias = None
+        else:
+            weight, bias, stream = cast_bias_weight(self, hidden_l_d, offloadable=True)
+        try:
+            logits = F.linear(hidden_l_d, weight)
+            return logits.reshape(hidden_l_d.shape[0], self.num_codebooks, self.vocab_size)
+        finally:
+            uncast_bias_weight(self, weight, bias, stream)
+
+
+def _comfy_qwen3_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    if not hasattr(self, "_v") and self.weight.device == hidden_states.device:
+        weight = self.weight
+        stream = None
+        bias = None
+    else:
+        weight, bias, stream = cast_bias_weight(self, hidden_states, offloadable=True)
+    try:
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return weight * hidden_states.to(input_dtype)
+    finally:
+        uncast_bias_weight(self, weight, bias, stream)
+
+
+def _patch_qwen3_rmsnorm(module: nn.Module) -> None:
+    if getattr(module, "_higgs_comfy_cast_rmsnorm", False):
+        return
+    module.bias = None
+    module.comfy_cast_weights = True
+    module.weight_function = []
+    module.bias_function = []
+    module.forward = _comfy_qwen3_rmsnorm_forward.__get__(module, module.__class__)
+    module._higgs_comfy_cast_rmsnorm = True
+
+
+def set_runtime_dtype(module: nn.Module, dtype: torch.dtype) -> None:
+    """Tag floating tensors with the dtype Comfy/AIMDO should materialize."""
+    for sub in module.modules():
+        for name, value in sub.named_parameters(recurse=False):
+            if value is not None and value.is_floating_point():
+                setattr(sub, f"{name}_comfy_model_dtype", dtype)
+        for name, value in sub.named_buffers(recurse=False):
+            if value is not None and value.is_floating_point():
+                setattr(sub, f"{name}_comfy_model_dtype", dtype)
+
+
+def convert_modules_for_comfy(model: nn.Module) -> None:
+    """Patch castable modules in-place so DynamicVRAM can page their weights."""
+    for module in model.modules():
+        if isinstance(module, (_ComfyLinear, _ComfyEmbedding, _ComfyConv1d, _ComfyConvTranspose1d)):
+            continue
+        if isinstance(module, nn.Linear):
+            module.__class__ = _ComfyLinear
+        elif type(module) is nn.Embedding:
+            module.__class__ = _ComfyEmbedding
+        elif isinstance(module, nn.Conv1d) and not hasattr(module, "parametrizations"):
+            module.__class__ = _ComfyConv1d
+        elif isinstance(module, nn.ConvTranspose1d) and not hasattr(module, "parametrizations"):
+            module.__class__ = _ComfyConvTranspose1d
+        elif isinstance(module, HiggsFusedMultiTextEmbedding):
+            module.__class__ = _ComfyHiggsFusedMultiTextEmbedding
+        elif isinstance(module, HiggsFusedMultiTextHead):
+            module.__class__ = _ComfyHiggsFusedMultiTextHead
+        elif module.__class__.__name__ == "Qwen3RMSNorm" and hasattr(module, "variance_epsilon"):
+            _patch_qwen3_rmsnorm(module)
 
 
 def map_higgs_weight_name(name: str) -> str | None:

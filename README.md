@@ -4,9 +4,9 @@
 
 **English** | **[中文](./README_zh.md)**
 
-**Version: v0.1.5**
+**Version: v0.1.7**
 
-ComfyUI nodes for [bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b): multilingual conversational TTS, zero-shot voice cloning, inline emotion/style/prosody/SFX tags, longform chunking, multi-speaker dialogue, Whisper reference transcription, and ComfyUI/AIMDO memory tracking.
+ComfyUI nodes for [bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b): multilingual conversational TTS, zero-shot voice cloning, inline emotion/style/prosody/SFX tags, longform chunking, multi-speaker dialogue, Whisper reference transcription, and ComfyUI/AIMDO DynamicVRAM support.
 
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-orange)](https://github.com/comfyanonymous/ComfyUI)
 [![Hugging Face](https://img.shields.io/badge/HuggingFace-bosonai%2Fhiggs--audio--v3--tts--4b-blue)](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b)
@@ -24,7 +24,7 @@ ComfyUI nodes for [bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai
 - **Multi-speaker dialogue** - Use `[Speaker_1]:`, `[Speaker_2]:`, etc. with separate reference voices.
 - **Inline controls** - Emotion, style, prosody, pauses, and sound effects can be typed directly in the prompt.
 - **Longform chunking** - Splits long text at sentence/pause boundaries and avoids cutting through `<|...|>` tags.
-- **AIMDO/VRAM visibility** - Higgs and Whisper torch modules are registered with ComfyUI model management using real tensors.
+- **AIMDO DynamicVRAM support** - Higgs model/codec weights load CPU-first and use ComfyUI/AIMDO paging when DynamicVRAM is active.
 - **Managed model folder** - Model files live under `ComfyUI/models/higgsv3tts/`.
 - **No keep-loaded toggle, no unload node** - The loader handles model-switch cleanup internally.
 
@@ -83,7 +83,7 @@ If `download_if_missing` is enabled and `model.safetensors` is absent, the loade
 ComfyUI/models/higgsv3tts/higgs-audio-v3-tts-4b/
 ```
 
-The checkpoint is about **9.31 GB** on disk. Expect roughly **11 GB VRAM** for the Higgs model/codec path with `bf16` on CUDA, plus extra headroom for ComfyUI and any other loaded models.
+The checkpoint is about **9.31 GB** on disk. Expect roughly **11 GB VRAM** for the Higgs model/codec path with `bf16` on CUDA, plus extra headroom for ComfyUI and any other loaded models. AIMDO DynamicVRAM can reduce live VRAM pressure by paging castable weights, but 11 GB+ is still the recommended target until lower-VRAM workflows are tested thoroughly.
 
 ## Nodes
 
@@ -353,7 +353,7 @@ If an optional attention package is not installed, selecting it raises a clear e
 
 ## Memory Behavior
 
-Higgs v3 and Whisper are registered with ComfyUI model management so memory tools can inspect real tensor residency.
+Higgs v3 loads weights on CPU first, patches the Qwen/Higgs/codec torch modules into Comfy-castable modules, and registers the model plus codec through ComfyUI model management. When AIMDO DynamicVRAM is active, castable weights are VBAR-backed and paged into VRAM during forward passes; without AIMDO, ComfyUI falls back to normal static model loading. Whisper is also registered with ComfyUI model management.
 
 There is no dedicated unload node and no keep-loaded toggle. Changing model, dtype, device, or attention settings hard-unloads the previous active Higgs bundle before loading the new one: it unregisters the Comfy model patchers, clears AIMDO state, moves weights to meta, breaks bundle references, runs Python GC, and asks Comfy/PyTorch to empty accelerator caches.
 
