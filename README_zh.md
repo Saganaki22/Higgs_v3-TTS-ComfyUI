@@ -116,6 +116,7 @@ ComfyUI/models/higgsv3tts/higgs-audio-v3-tts-4b/
 | `seed` | INT | `0` | `0` 使用当前随机状态；正值种子会在每个长文本块中保持不变并重复使用。 |
 | `longform_chunking` | BOOLEAN | `True` | 在句子/停顿边界安全拆分长文本。关闭时节点只进行一次直接生成。 |
 | `words_per_chunk` | INT | `45` | 目标块大小。35-55 左右更适合 2048 token 默认值；CJK 文本按字符式分割。 |
+| `tag_chunk` | BOOLEAN | `False` | 在每个 `<\|...\|>` 标签处切块，而不是只在句子边界切分。超长的标签段仍按 `words_per_chunk` 拆分，并把当前标签重新插入每个新块的开头，以保持语气/音色。 |
 | `pause_between_chunks` | FLOAT | `0.15` | 块之间插入的静音时长（秒）。 |
 
 **输出：** `audio`（`AUDIO`）
