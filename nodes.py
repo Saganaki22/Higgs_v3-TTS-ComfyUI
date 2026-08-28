@@ -167,6 +167,13 @@ def _generation_controls() -> dict:
                 "tooltip": "Target words per chunk. Around 35-55 fits the 2048-token default better; raise with max_new_tokens for longer chunks.",
             },
         ),
+        "tag_chunk": (
+            "BOOLEAN",
+            {
+                "default": False,
+                "tooltip": "Cut chunks at every <|...|> tag instead of only at sentence breaks. Oversized tag sections are still split by words_per_chunk, with the active tag re-inserted at the start of each new piece so it keeps the tone/voice.",
+            },
+        ),
         "pause_between_chunks": (
             "FLOAT",
             {
@@ -293,6 +300,111 @@ def _smart_chunk_text(text: str, words_per_chunk: int, enabled: bool) -> list[st
     return [chunk for chunk in chunks if chunk]
 
 
+def _split_content_by_words(content: str, words_per_chunk: int) -> list[str]:
+    """Word/character split for a tag-free span of text (used by _tag_chunk_text)."""
+    content = content.strip()
+    if not content:
+        return []
+    if words_per_chunk <= 0:
+        return [content]
+
+    cjk_count = sum(1 for ch in content if _is_cjk(ch))
+    alpha_count = sum(1 for ch in content if ch.isalpha() or _is_cjk(ch))
+    if alpha_count > 0 and cjk_count / alpha_count > 0.3:
+        return _chunk_by_characters(content, words_per_chunk)
+
+    words = content.split()
+    if len(words) <= words_per_chunk:
+        return [content]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for word in words:
+        current.append(word)
+        if len(current) >= words_per_chunk:
+            candidate = " ".join(current)
+            split = _tag_safe_boundary(candidate)
+            if split is not None and split >= max(20, len(candidate) // 3):
+                final = candidate[:split].strip()
+                rest = candidate[split:].strip()
+                if final:
+                    chunks.append(final)
+                current = rest.split() if rest else []
+            else:
+                chunks.append(candidate.strip())
+                current = []
+    if current:
+        chunks.append(" ".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _tag_chunk_text(text: str, words_per_chunk: int) -> list[str]:
+    """Chunk text by cutting right before every <|...|> tag.
+
+    Any text before the first tag becomes its own leading chunk. From there,
+    each tag (or run of back-to-back tags) opens a new chunk that runs until
+    the next tag. If that tag's section is longer than words_per_chunk, it is
+    split further on word boundaries, and the section's tag(s) are
+    automatically re-inserted at the front of every extra piece so later
+    pieces still inherit the tone/voice the tag set.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    tag_re = re.compile(r"<\|[^|]*\|>")
+    matches = list(tag_re.finditer(text))
+    if not matches:
+        return _split_content_by_words(text, words_per_chunk) or [text]
+
+    # Group the text into segments, one per tag (or per run of adjacent tags
+    # separated only by whitespace), each holding its tag(s) plus the content
+    # that follows until the next tag.
+    segments: list[str] = []
+    if matches[0].start() > 0:
+        segments.append(text[: matches[0].start()])
+
+    i = 0
+    while i < len(matches):
+        block_start = matches[i].start()
+        j = i
+        while j + 1 < len(matches):
+            gap = text[matches[j].end() : matches[j + 1].start()]
+            if gap.strip() == "":
+                j += 1
+            else:
+                break
+        seg_end = matches[j + 1].start() if j + 1 < len(matches) else len(text)
+        segments.append(text[block_start:seg_end])
+        i = j + 1
+
+    leading_tags_re = re.compile(r"^(?:\s*<\|[^|]*\|>)+")
+    chunks: list[str] = []
+    for segment in segments:
+        leading = leading_tags_re.match(segment)
+        if not leading:
+            # Text before the very first tag in the whole string.
+            chunks.extend(_split_content_by_words(segment, words_per_chunk))
+            continue
+
+        tag_prefix = segment[: leading.end()].strip()
+        content = segment[leading.end() :].strip()
+
+        if not content:
+            # A tag with nothing after it (e.g. a trailing sfx tag); keep it
+            # with whatever came before instead of emitting an empty chunk.
+            if chunks:
+                chunks[-1] = f"{chunks[-1]} {tag_prefix}".strip()
+            else:
+                chunks.append(tag_prefix)
+            continue
+
+        for piece in _split_content_by_words(content, words_per_chunk):
+            chunks.append(f"{tag_prefix}{piece}")
+
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
 def _concat_audio_segments(segments: list[dict], pause_seconds: float) -> dict:
     if not segments:
         raise RuntimeError("No audio segments were generated.")
@@ -337,6 +449,7 @@ def _generate_chunked_audio(
     seed: int,
     longform_chunking: bool,
     words_per_chunk: int,
+    tag_chunk: bool = False,
     pause_between_chunks: float,
     progress_callback=None,
     use_first_chunk_as_reference: bool = False,
@@ -372,14 +485,18 @@ def _generate_chunked_audio(
             progress_callback(PROGRESS_UNITS_PER_SEGMENT, PROGRESS_UNITS_PER_SEGMENT)
         return audio
 
-    chunks = _smart_chunk_text(text, int(words_per_chunk), bool(longform_chunking))
+    if bool(tag_chunk):
+        chunks = _tag_chunk_text(text, int(words_per_chunk))
+    else:
+        chunks = _smart_chunk_text(text, int(words_per_chunk), bool(longform_chunking))
     if not chunks:
         raise ValueError("Text cannot be empty.")
     if len(chunks) > 1:
         logger.info(
-            "Higgs v3 longform chunking: %d chunks, target=%d words/chars.",
+            "Higgs v3 longform chunking: %d chunks, target=%d words/chars, tag_chunk=%s.",
             len(chunks),
             int(words_per_chunk),
+            bool(tag_chunk),
         )
     segments: list[dict] = []
     delivery_state = _delivery_state_from_prefix(control_prefix)
@@ -389,7 +506,12 @@ def _generate_chunked_audio(
     for index, chunk in enumerate(chunks):
         local_seed = int(seed) if seed else 0
         skip_categories = _initial_delivery_categories(chunk)
-        if index == 0 and control_prefix:
+        if bool(tag_chunk):
+            # tag_chunk already carries the right <|...|> tag(s) in front of
+            # every chunk it produces, so only the caller-provided prefix (if
+            # any) is added, and only to the very first chunk.
+            active_prefix = control_prefix if index == 0 else ""
+        elif index == 0 and control_prefix:
             active_prefix = control_prefix
         else:
             # Strong emotions can overpower clone conditioning when automatically
@@ -552,6 +674,7 @@ class HiggsV3Generate:
         seed: int,
         longform_chunking: bool,
         words_per_chunk: int,
+        tag_chunk: bool,
         pause_between_chunks: float,
     ) -> tuple[dict]:
         pbar = ProgressBar(PROGRESS_UNITS_PER_SEGMENT) if ProgressBar is not None else None
@@ -573,6 +696,7 @@ class HiggsV3Generate:
             seed=int(seed),
             longform_chunking=bool(longform_chunking),
             words_per_chunk=int(words_per_chunk),
+            tag_chunk=bool(tag_chunk),
             pause_between_chunks=float(pause_between_chunks),
             progress_callback=update_progress,
             use_first_chunk_as_reference=True,
@@ -623,6 +747,7 @@ class HiggsV3VoiceClone:
         seed: int,
         longform_chunking: bool,
         words_per_chunk: int,
+        tag_chunk: bool,
         pause_between_chunks: float,
     ) -> tuple[dict]:
         pbar = ProgressBar(PROGRESS_UNITS_PER_SEGMENT) if ProgressBar is not None else None
@@ -644,6 +769,7 @@ class HiggsV3VoiceClone:
             seed=int(seed),
             longform_chunking=bool(longform_chunking),
             words_per_chunk=int(words_per_chunk),
+            tag_chunk=bool(tag_chunk),
             pause_between_chunks=float(pause_between_chunks),
             progress_callback=update_progress,
         )
@@ -738,6 +864,11 @@ def _io_generation_inputs() -> list:
             step=5,
             tooltip="Target words per chunk. Around 35-55 fits the 2048-token default better; raise with max_new_tokens for longer chunks.",
         ),
+        IO.Boolean.Input(
+            "tag_chunk",
+            default=False,
+            tooltip="Cut chunks at every <|...|> tag instead of only at sentence breaks. Oversized tag sections are still split by words_per_chunk, with the active tag re-inserted at the start of each new piece so it keeps the tone/voice.",
+        ),
         IO.Float.Input(
             "pause_between_chunks",
             default=0.15,
@@ -764,6 +895,7 @@ def _generate_multi_speaker_audio(
     seed: int,
     longform_chunking: bool,
     words_per_chunk: int,
+    tag_chunk: bool = False,
     pause_between_chunks: float,
 ) -> dict:
     turns = _parse_dialogue_lines(text)
@@ -813,6 +945,7 @@ def _generate_multi_speaker_audio(
                 seed=local_seed,
                 longform_chunking=bool(longform_chunking),
                 words_per_chunk=int(words_per_chunk),
+                tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
                 progress_callback=update_turn,
             )
@@ -887,6 +1020,7 @@ if _HAS_DYNAMIC_COMBO:
             seed: int,
             longform_chunking: bool,
             words_per_chunk: int,
+            tag_chunk: bool,
             pause_between_chunks: float,
         ) -> IO.NodeOutput:
             speaker_count = int(num_speakers.get("num_speakers", 2))
@@ -912,6 +1046,7 @@ if _HAS_DYNAMIC_COMBO:
                 seed=int(seed),
                 longform_chunking=bool(longform_chunking),
                 words_per_chunk=int(words_per_chunk),
+                tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
             )
             return IO.NodeOutput(audio)
@@ -1021,6 +1156,7 @@ else:
             seed: int,
             longform_chunking: bool,
             words_per_chunk: int,
+            tag_chunk: bool,
             pause_between_chunks: float,
             **kwargs,
         ) -> tuple[dict]:
@@ -1051,6 +1187,7 @@ else:
                 seed=int(seed),
                 longform_chunking=bool(longform_chunking),
                 words_per_chunk=int(words_per_chunk),
+                tag_chunk=bool(tag_chunk),
                 pause_between_chunks=float(pause_between_chunks),
             )
             return (audio,)
