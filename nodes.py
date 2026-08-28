@@ -7,7 +7,7 @@ import re
 
 import torch
 
-from .loader import ATTENTION_OPTIONS, DEVICE_OPTIONS, DTYPE_OPTIONS, get_model_choices, load_higgs_bundle
+from .loader import ATTENTION_OPTIONS, DEVICE_OPTIONS, DTYPE_OPTIONS, bundle_state_token, get_model_choices, load_higgs_bundle, reload_dead_bundle
 from .native import generate_higgs_audio
 from .whisper import HiggsV3WhisperTranscribe
 
@@ -314,6 +314,15 @@ def _concat_audio_segments(segments: list[dict], pause_seconds: float) -> dict:
     return {"waveform": torch.cat(parts, dim=-1).contiguous(), "sample_rate": sample_rate}
 
 
+def _ensure_bundle_is_loaded(higgs_model):
+    """Reload the bundle in place if it was unloaded elsewhere in the graph
+    (e.g. a Clear VRAM node) since Load Model produced it, instead of just
+    erroring out. This does not depend on ComfyUI re-running Load Model."""
+    if higgs_model is None:
+        raise RuntimeError("No Higgs v3 model connected. Add a Higgs v3 Load Model node before this one.")
+    if getattr(higgs_model, "codec", None) is None or getattr(higgs_model, "model", None) is None:
+        reload_dead_bundle(higgs_model)
+
 def _generate_chunked_audio(
     higgs_model,
     *,
@@ -332,6 +341,7 @@ def _generate_chunked_audio(
     progress_callback=None,
     use_first_chunk_as_reference: bool = False,
 ) -> dict:
+    _ensure_bundle_is_loaded(higgs_model)
     if not bool(longform_chunking):
         prompt_text = control_prefix + text
         logger.info("Higgs v3 generating single pass: %s", text[:90])
@@ -506,6 +516,16 @@ class HiggsV3LoadModel:
             download_if_missing=bool(download_if_missing),
         )
         return (bundle,)
+
+    @classmethod
+    def IS_CHANGED(cls, model: str, dtype: str, device: str, attention: str, download_if_missing: bool):
+        # If nothing about the widgets changed, ComfyUI would normally reuse
+        # its cached bundle output untouched. bundle_state_token() flips to
+        # "unloaded" the moment something (a Clear VRAM node, ComfyUI's own
+        # memory manager, etc.) has torn down the active bundle in the
+        # background, which forces a fresh load() instead of handing a dead
+        # bundle to the next node in the graph.
+        return bundle_state_token()
 
 
 class HiggsV3Generate:

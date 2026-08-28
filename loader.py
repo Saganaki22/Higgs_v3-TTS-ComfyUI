@@ -463,37 +463,16 @@ def unload_higgs_bundle(bundle: HiggsV3Bundle | None, reason: str = "manual unlo
         _ACTIVE_LOAD_KEY = None
 
 
-def load_higgs_bundle(
-    model_choice: str,
-    dtype_name: str,
-    device_name: str,
-    attention: str,
-    download_if_missing: bool,
-) -> HiggsV3Bundle:
-    global _ACTIVE_BUNDLE, _ACTIVE_LOAD_KEY
-
-    register_model_folder()
-    runtime_dir = resolve_model_dir(model_choice, download_if_missing)
-    device = resolve_device(device_name)
-    torch_dtype = resolve_dtype(dtype_name, device)
-    runtime_attention, hf_attention = resolve_attention(attention)
-
-    model_file = runtime_dir / "model.safetensors"
-    load_key = (
-        str(runtime_dir.resolve()),
-        model_file.stat().st_mtime_ns,
-        str(device),
-        str(torch_dtype),
-        runtime_attention,
-    )
-    if _ACTIVE_BUNDLE is not None and _ACTIVE_LOAD_KEY == load_key:
-        resume_bundle_to_device(_ACTIVE_BUNDLE)
-        return _ACTIVE_BUNDLE
-    if _ACTIVE_BUNDLE is not None:
-        unload_higgs_bundle(_ACTIVE_BUNDLE, reason="load settings changed")
-
+def _build_bundle_contents(
+    runtime_dir: Path,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    hf_attention: str | None,
+) -> tuple[torch.nn.Module, HiggsAudioCodec, Any, list[Any]]:
+    """Build (model, codec, tokenizer, patchers) for a bundle. Shared by a
+    fresh load_higgs_bundle() call and by reload_dead_bundle(), which rebuilds
+    the same contents in place after an external unload (e.g. Clear VRAM)."""
     config = read_config(runtime_dir)
-    logger.info("Loading Higgs v3 from %s on %s with dtype=%s attention=%s", runtime_dir, device, torch_dtype, runtime_attention)
     weight_device = torch.device("cpu") if device.type != "cpu" else device
     model = build_native_model(config, torch_dtype, hf_attention)
     load_native_weights(model, runtime_dir, weight_device, torch_dtype)
@@ -533,6 +512,41 @@ def load_higgs_bundle(
         _empty_accelerator_cache()
         raise
 
+    return model, codec, tokenizer, patchers
+
+
+def load_higgs_bundle(
+    model_choice: str,
+    dtype_name: str,
+    device_name: str,
+    attention: str,
+    download_if_missing: bool,
+) -> HiggsV3Bundle:
+    global _ACTIVE_BUNDLE, _ACTIVE_LOAD_KEY
+
+    register_model_folder()
+    runtime_dir = resolve_model_dir(model_choice, download_if_missing)
+    device = resolve_device(device_name)
+    torch_dtype = resolve_dtype(dtype_name, device)
+    runtime_attention, hf_attention = resolve_attention(attention)
+
+    model_file = runtime_dir / "model.safetensors"
+    load_key = (
+        str(runtime_dir.resolve()),
+        model_file.stat().st_mtime_ns,
+        str(device),
+        str(torch_dtype),
+        runtime_attention,
+    )
+    if _ACTIVE_BUNDLE is not None and _ACTIVE_LOAD_KEY == load_key:
+        resume_bundle_to_device(_ACTIVE_BUNDLE)
+        return _ACTIVE_BUNDLE
+    if _ACTIVE_BUNDLE is not None:
+        unload_higgs_bundle(_ACTIVE_BUNDLE, reason="load settings changed")
+
+    logger.info("Loading Higgs v3 from %s on %s with dtype=%s attention=%s", runtime_dir, device, torch_dtype, runtime_attention)
+    model, codec, tokenizer, patchers = _build_bundle_contents(runtime_dir, device, torch_dtype, hf_attention)
+
     bundle = HiggsV3Bundle(
         model=model,
         codec=codec,
@@ -551,8 +565,74 @@ def load_higgs_bundle(
     return bundle
 
 
+def reload_dead_bundle(bundle: HiggsV3Bundle) -> HiggsV3Bundle:
+    """Self-heal a bundle whose weights were torn down elsewhere in the graph
+    (e.g. a Clear VRAM node) since Load Model produced it.
+
+    ComfyUI may keep handing out that same cached HiggsV3Bundle object to
+    Generate/Clone nodes without re-running Load Model first, regardless of
+    IS_CHANGED. Rather than depending on ComfyUI noticing, this rebuilds the
+    model/codec/tokenizer from the settings already recorded on the bundle
+    and mutates it *in place*, so every existing reference to this exact
+    object (including whatever the Load Model node still has cached) becomes
+    valid again, and no manual re-run is needed.
+    """
+    global _ACTIVE_BUNDLE, _ACTIVE_LOAD_KEY
+
+    runtime_dir = bundle.model_dir
+    device = bundle.device
+    torch_dtype = bundle.torch_dtype
+    # bundle.attention already holds the resolved runtime choice (sdpa /
+    # flash_attention / sageattention), which resolve_attention() accepts
+    # as-is and re-resolves to the matching hf_attention value.
+    _runtime_attention, hf_attention = resolve_attention(bundle.attention)
+
+    logger.warning(
+        "Higgs v3 bundle was unloaded elsewhere (e.g. Clear VRAM) since it was last loaded; "
+        "reloading it automatically from %s on %s.",
+        runtime_dir,
+        device,
+    )
+    model, codec, tokenizer, patchers = _build_bundle_contents(runtime_dir, device, torch_dtype, hf_attention)
+
+    bundle.model = model
+    bundle.codec = codec
+    bundle.tokenizer = tokenizer
+    bundle.patchers = patchers
+
+    model_file = runtime_dir / "model.safetensors"
+    load_key = (
+        str(Path(runtime_dir).resolve()),
+        model_file.stat().st_mtime_ns,
+        str(device),
+        str(torch_dtype),
+        bundle.attention,
+    )
+    _ACTIVE_BUNDLE = bundle
+    _ACTIVE_LOAD_KEY = load_key
+    install_comfy_unload_hook()
+    _empty_accelerator_cache()
+    return bundle
+
+
 def unload_active_bundle() -> None:
     unload_higgs_bundle(_ACTIVE_BUNDLE, reason="active unload")
+
+
+def bundle_state_token() -> str:
+    """Cheap token that changes whenever the active native Higgs bundle is
+    unloaded (e.g. by a Clear VRAM node or ComfyUI's own memory management).
+
+    ComfyUI caches a node's output as long as its widget inputs are unchanged
+    AND its IS_CHANGED return value is unchanged. Without this, an external
+    unload can null out the fields on the *same* cached HiggsV3Bundle object
+    the Load Model node previously returned, so a later run reuses a dead
+    bundle instead of reloading. Feeding this token into IS_CHANGED forces a
+    reload exactly when that has happened, and only then.
+    """
+    if _ACTIVE_BUNDLE is None:
+        return "unloaded"
+    return f"loaded:{id(_ACTIVE_BUNDLE)}"
 
 
 def install_comfy_unload_hook() -> None:
