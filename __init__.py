@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "v0.1.8"
+__version__ = "v0.1.9"
 
 import importlib.metadata as _metadata
 import importlib.util

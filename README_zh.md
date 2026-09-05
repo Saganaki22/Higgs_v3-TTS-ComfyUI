@@ -4,7 +4,7 @@
 
 **[English](./README.md)** | **中文**
 
-**版本：v0.1.8**
+**版本：v0.1.9**
 
 [bosonai/higgs-audio-v3-tts-4b](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) 的 ComfyUI 原生节点：多语言对话式 TTS、零样本语音克隆、内联情感/风格/韵律/音效标签、长文本分块、多说话人对话、Whisper 参考音频转写，以及 ComfyUI/AIMDO DynamicVRAM 支持。
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import json
 import logging
 import shutil
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ SMALL_ASSET_PATTERNS = [
     "tokenizer_config.json",
     "assets/model_architecture.png",
 ]
+JSON_ASSET_NAMES = ("config.json", "tokenizer.json", "model.safetensors.index.json")
 
 _ACTIVE_BUNDLE: "HiggsV3Bundle | None" = None
 _ACTIVE_LOAD_KEY: tuple[Any, ...] | None = None
@@ -112,14 +114,40 @@ def assets_dir() -> Path:
     return path
 
 
+def _json_asset_is_valid(path: Path) -> bool:
+    """True when the file exists and parses as JSON. Detects corrupt assets
+    (git-LFS pointer stubs, HTML error pages, truncated copies) that plain
+    is_file() checks would happily accept."""
+    try:
+        if not path.is_file():
+            return False
+        with path.open("r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:
+        return False
+
+
 def ensure_small_assets(download_if_missing: bool) -> Path:
     dest = assets_dir()
-    required = [dest / "config.json", dest / "tokenizer.json", dest / "model.safetensors.index.json"]
-    if all(path.is_file() for path in required):
+    required = [dest / name for name in JSON_ASSET_NAMES]
+    if all(_json_asset_is_valid(path) for path in required):
         return dest
-    if not download_if_missing:
-        missing = [str(path) for path in required if not path.is_file()]
-        raise FileNotFoundError(f"Missing Higgs v3 small assets: {missing}. Enable download_if_missing.")
+
+    corrupt = [path for path in required if path.exists() and not _json_asset_is_valid(path)]
+    missing = [path for path in required if not path.exists()]
+    if corrupt:
+        listing = ", ".join(str(path) for path in corrupt)
+        if not download_if_missing:
+            raise ValueError(
+                f"Higgs v3 asset file(s) are corrupt (not valid JSON): {listing}. "
+                "This usually means an interrupted download, a git-LFS pointer stub, or an HTML error page "
+                "was saved instead of the real file. Delete the listed file(s) or enable download_if_missing "
+                "to replace them automatically."
+            )
+        logger.warning("Higgs v3 asset file(s) are corrupt and will be re-downloaded: %s", listing)
+    if missing and not download_if_missing:
+        raise FileNotFoundError(f"Missing Higgs v3 small assets: {[str(path) for path in missing]}. Enable download_if_missing.")
 
     from huggingface_hub import snapshot_download
 
@@ -132,6 +160,15 @@ def ensure_small_assets(download_if_missing: bool) -> Path:
         "endpoint": HF_ENDPOINT,
     }
     snapshot_download(**kwargs)
+
+    still_corrupt = [path for path in required if not _json_asset_is_valid(path)]
+    if still_corrupt:
+        listing = ", ".join(str(path) for path in still_corrupt)
+        raise ValueError(
+            f"Higgs v3 asset file(s) are still not valid JSON after re-download: {listing}. "
+            f"The endpoint ({HF_ENDPOINT}) may have returned an HTML error page instead of the file. "
+            "Check network/proxy access to Hugging Face, then delete the listed file(s) and try again."
+        )
     return dest
 
 
@@ -142,9 +179,18 @@ def _copy_small_assets_to_model_dir(runtime_dir: Path, asset_dir: Path) -> None:
             continue
         dst = runtime_dir / rel
         if dst.is_file():
-            continue
+            repairable = (
+                rel in JSON_ASSET_NAMES
+                and _json_asset_is_valid(src)
+                and not _json_asset_is_valid(dst)
+            )
+            if not repairable:
+                continue
+            logger.warning("Replacing corrupt Higgs v3 asset %s from bundled assets.", dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        tmp = dst.with_name(dst.name + ".tmp_copy")
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
 
 
 def _has_model_file(path: Path) -> bool:

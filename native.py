@@ -207,7 +207,20 @@ class HiggsTokenizerAdapter:
 
 
 def load_tokenizer(model_dir: Path) -> HiggsTokenizerAdapter:
-    raw = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+    tokenizer_path = model_dir / "tokenizer.json"
+    try:
+        raw = Tokenizer.from_file(str(tokenizer_path))
+    except Exception as exc:
+        try:
+            preview = tokenizer_path.read_bytes()[:80].decode("utf-8", errors="replace")
+        except Exception:
+            preview = "<unreadable>"
+        raise RuntimeError(
+            f"Higgs v3 tokenizer file is corrupt or not valid JSON: {tokenizer_path} "
+            f"(parse error: {exc}). First bytes: {preview!r}. This usually means the file is a "
+            "git-LFS pointer stub, an HTML error page, or a partial download/copy. Delete that "
+            "file and run Load Model again (with download_if_missing enabled) so it is restored."
+        ) from exc
     return HiggsTokenizerAdapter(PreTrainedTokenizerFast(tokenizer_object=raw))
 
 

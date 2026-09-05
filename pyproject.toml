@@ -1,7 +1,7 @@
 [project]
 name = "Higgs_v3-TTS-ComfyUI"
 description = "ComfyUI custom nodes for Higgs Audio v3 TTS with native inference, voice cloning, multi-speaker dialogue, longform chunking, and AIMDO DynamicVRAM support"
-version = "0.1.8"
+version = "0.1.9"
 license = {file = "LICENSE"}
 dependencies = [
     "accelerate",
