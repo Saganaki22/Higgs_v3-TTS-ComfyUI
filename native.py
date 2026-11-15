@@ -447,6 +447,7 @@ class HiggsAudioCodec:
 
 class _ComfyLinear(nn.Linear):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
 
@@ -462,6 +463,7 @@ class _ComfyLinear(nn.Linear):
 
 class _ComfyEmbedding(nn.Embedding):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
     bias = None
@@ -490,6 +492,7 @@ class _ComfyEmbedding(nn.Embedding):
 
 class _ComfyConv1d(nn.Conv1d):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
 
@@ -509,6 +512,7 @@ class _ComfyConv1d(nn.Conv1d):
 
 class _ComfyConvTranspose1d(nn.ConvTranspose1d):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
 
@@ -556,6 +560,7 @@ class _ComfyConvTranspose1d(nn.ConvTranspose1d):
 
 class _ComfyHiggsFusedMultiTextEmbedding(HiggsFusedMultiTextEmbedding):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
     bias = None
@@ -588,6 +593,7 @@ class _ComfyHiggsFusedMultiTextEmbedding(HiggsFusedMultiTextEmbedding):
 
 class _ComfyHiggsFusedMultiTextHead(HiggsFusedMultiTextHead):
     comfy_cast_weights = True
+    _combined_linear = None
     weight_function = []
     bias_function = []
     bias = None
@@ -628,6 +634,7 @@ def _patch_qwen3_rmsnorm(module: nn.Module) -> None:
         return
     module.bias = None
     module.comfy_cast_weights = True
+    module._combined_linear = None
     module.weight_function = []
     module.bias_function = []
     module.forward = _comfy_qwen3_rmsnorm_forward.__get__(module, module.__class__)
