@@ -341,9 +341,11 @@ def _register_many_with_comfy(patchers: list[Any]) -> None:
             if loaded.model is not None
         }
         to_load = [patcher for patcher in patchers if id(patcher) not in already_loaded]
-        if not to_load:
-            return
-        mm.load_models_gpu(to_load)
+        # Call this for models that are already registered too. With AIMDO a model
+        # stays in current_loaded_models after another model has evicted its weights,
+        # and only load_models_gpu gives it VRAM priority again. Skipping it left
+        # generation running from RAM at about 1 token/s.
+        mm.load_models_gpu(patchers)
         for patcher in to_load:
             logger.info(
                 "Loaded %s through ComfyUI%s memory management.",
